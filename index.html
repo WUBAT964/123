@@ -72,7 +72,6 @@
 
   .info{color:var(--faint);font-size:11px;margin-left:auto;
     font-family:Consolas,monospace}
-
   .tip{color:var(--faint);font-size:11px;margin-top:8px;line-height:1.6}
 
   .toast{position:fixed;left:50%;bottom:30px;
@@ -95,6 +94,41 @@
     .stats{grid-template-columns:repeat(2,1fr)}
     .info{width:100%;margin-left:0;margin-top:6px}
   }
+
+  /* ============ 浮窗样式（PiP 窗口用） ============ */
+  .pip-root{
+    background:var(--bg); color:var(--text);
+    font-family:"Segoe UI","PingFang SC",sans-serif;
+    padding:10px 12px; height:100vh; overflow:hidden;
+    display:flex; flex-direction:column; gap:6px;
+    -webkit-user-select:none; user-select:none;
+  }
+  .pip-head{display:flex; align-items:baseline; gap:8px}
+  .pip-fps{
+    font-family:Consolas,monospace; font-size:42px; font-weight:700;
+    line-height:1; color:var(--green);
+    transition:color .3s ease; font-variant-numeric:tabular-nums;
+  }
+  .pip-unit{font-size:13px; color:var(--dim); font-weight:600}
+  .pip-ms{
+    margin-left:auto; font-family:Consolas,monospace; font-size:11px;
+    color:var(--faint);
+  }
+  .pip-chart{
+    display:block; width:100%; flex:1; min-height:60px;
+    background:var(--card); border-radius:8px;
+  }
+  .pip-stats{
+    display:flex; justify-content:space-between; gap:6px;
+    font-family:Consolas,monospace; font-size:11px; color:var(--faint);
+  }
+  .pip-stats b{
+    color:var(--text); font-weight:700;
+    font-variant-numeric:tabular-nums;
+  }
+  .pip-stats b.ok{color:var(--green)}
+  .pip-stats b.warn{color:var(--yellow)}
+  .pip-stats b.bad{color:var(--red)}
 </style>
 </head>
 <body>
@@ -130,22 +164,20 @@
       <div class="stat purple"><div class="k">0.1% Low</div><div class="v" id="s-p01">--</div></div>
       <div class="stat red"><div class="k">卡顿次数</div><div class="v" id="s-stut">--</div></div>
     </div>
-    <div class="tip">
-      1% Low / 0.1% Low = 最差 1% / 0.1% 帧的平均 FPS，反映卡顿感。卡顿 = 帧耗时 &gt; 平均的 2 倍。
-    </div>
   </div>
 
   <div class="card">
     <div class="controls">
       <button class="btn primary" id="btn-toggle">开始记录</button>
       <button class="btn" id="btn-export" disabled>导出 CSV</button>
+      <button class="btn" id="btn-pip">◱ 开启浮窗</button>
       <button class="btn" id="btn-wake">☀ 屏幕常亮</button>
       <button class="btn danger" id="btn-reset">清空</button>
       <div class="info" id="info">未开始</div>
     </div>
     <div class="tip">
-      <b>屏幕常亮</b>：防止测试时自动熄屏。切换标签页/锁屏后 Wake Lock 会自动释放，切回页面需重新点击开启。<br>
-      切后台期间 <b>自动暂停记录</b>，恢复后从新的一段开始，导出 CSV 会按 segment 分段。
+      <b>浮窗</b>：Chrome / Edge 116+ 支持，开启后是一个始终置顶的小窗，切标签页也不受影响。<br>
+      <b>屏幕常亮</b>：防止测试时熄屏。切后台会自动释放，切回需再点一次。
     </div>
   </div>
 </div>
@@ -158,9 +190,9 @@
 
   // ==================== 状态 ====================
   var recording = false;
-  var samples = [];        // {segment, t, dt, fps}
-  var segment = 0;         // 当前段号
-  var startTime = 0;       // 本段起点（performance.now）
+  var samples = [];
+  var segment = 0;
+  var startTime = 0;
   var lastFrameT = 0;
 
   var HISTORY = 300;
@@ -172,11 +204,29 @@
   var fpsBuffer = [];
   var FPS_SMOOTH_WINDOW = 10;
 
+  var stats = {
+    avg: null, min: null, max: null,
+    p1: null, p01: null, stutters: null
+  };
+
   // ==================== 工具 ====================
   function pad(n){ return String(n).padStart(2, '0'); }
-  function setText(id, t){ var e = document.getElementById(id); if (e) e.textContent = t; }
+  function setText(id, t){
+    var e = document.getElementById(id);
+    if (e) e.textContent = t;
+  }
   function fmt(n, d){ return Number.isFinite(n) ? n.toFixed(d) : '--'; }
   function now(){ return performance.now(); }
+  function fpsColorVar(f){
+    if (f >= 55) return 'var(--green)';
+    if (f >= 30) return 'var(--yellow)';
+    return 'var(--red)';
+  }
+  function fpsColorClass(f){
+    if (f >= 55) return 'ok';
+    if (f >= 30) return 'warn';
+    return 'bad';
+  }
 
   function showToast(msg, color){
     var t = document.getElementById('toast');
@@ -189,28 +239,21 @@
 
   // ==================== Wake Lock ====================
   var wakeLock = null;
-  var wakeWanted = false;   // 用户是否想开启
+  var wakeWanted = false;
 
   async function requestWakeLock(){
-    if (!('wakeLock' in navigator)){
-      showToast('此浏览器不支持屏幕常亮', 'var(--red)');
-      return false;
-    }
+    if (!('wakeLock' in navigator)) return false;
     try{
       wakeLock = await navigator.wakeLock.request('screen');
       wakeLock.addEventListener('release', function(){
-        // 系统自动释放（比如切后台），只提示不改变 wakeWanted
-        if (wakeWanted) console.log('Wake Lock 被释放（可能在后台）');
+        if (wakeWanted) console.log('Wake Lock 释放');
       });
-      console.log('✓ 屏幕常亮已开启');
       return true;
     }catch(e){
-      console.warn('无法开启屏幕常亮:', e);
-      showToast('无法开启屏幕常亮：' + e.message, 'var(--red)');
+      console.warn('Wake Lock 失败:', e);
       return false;
     }
   }
-
   async function releaseWakeLock(){
     if (wakeLock){
       try{ await wakeLock.release(); }catch(e){}
@@ -218,11 +261,9 @@
     }
   }
 
-  // 用户点击开关
   document.getElementById('btn-wake').onclick = async function(){
     var btn = this;
     if (!wakeWanted){
-      // 开启
       wakeWanted = true;
       var ok = await requestWakeLock();
       if (ok){
@@ -231,9 +272,9 @@
         showToast('屏幕常亮已开启', 'var(--green)');
       } else {
         wakeWanted = false;
+        showToast('此浏览器不支持屏幕常亮', 'var(--red)');
       }
     } else {
-      // 关闭
       wakeWanted = false;
       await releaseWakeLock();
       btn.classList.remove('active');
@@ -244,31 +285,22 @@
 
   // ==================== 页面可见性 ====================
   var hiddenAt = 0;
-
   document.addEventListener('visibilitychange', function(){
     if (document.hidden){
-      // 进后台：记录时间点，暂停采样
-      if (recording){
-        hiddenAt = now();
-        console.log('→ 页面隐藏，暂停记录');
-      }
+      if (recording) hiddenAt = now();
     } else {
-      // 回前台：跳过空档，开新段
       if (recording && hiddenAt > 0){
         var gap = now() - hiddenAt;
         segment++;
         startTime = now();
-        lastFrameT = 0;        // 重置帧计时，第一帧不会爆表
+        lastFrameT = 0;
         fpsBuffer = [];
         hiddenAt = 0;
-        console.log('← 页面恢复，新段 #' + segment + '，跳过 ' + (gap/1000).toFixed(1) + 's');
-        showToast('已跳过后台 ' + (gap/1000).toFixed(1) + 's，新段 #' + segment, 'var(--yellow)');
+        showToast('跳过后台 ' + (gap/1000).toFixed(1) + 's，新段 #' + segment, 'var(--yellow)');
       }
-      // 恢复屏幕常亮
       if (wakeWanted && !wakeLock){
         requestWakeLock().then(function(ok){
           if (!ok){
-            // 浏览器拒绝（可能没用户手势），把按钮状态回退
             wakeWanted = false;
             var btn = document.getElementById('btn-wake');
             btn.classList.remove('active');
@@ -279,7 +311,7 @@
     }
   });
 
-  // ==================== 折线图 ====================
+  // ==================== 折线图（主页面） ====================
   var chart = document.getElementById('chart');
   var ctx = chart.getContext('2d');
 
@@ -292,12 +324,10 @@
   }
   window.addEventListener('resize', resizeCanvas);
 
-  function drawChart(){
-    var dpr = window.devicePixelRatio || 1;
-    var w = chart.width / dpr, h = chart.height / dpr;
-    ctx.clearRect(0, 0, w, h);
-
-    var padL = 34, padT = 14, padR = 12, padB = 20;
+  function drawChartOn(c, cx, w, h, full){
+    cx.clearRect(0, 0, w, h);
+    var padL = full ? 34 : 20, padT = full ? 14 : 6,
+        padR = full ? 12 : 6,  padB = full ? 20 : 6;
     var x0 = padL, y0 = padT, x1 = w - padR, y1 = h - padB;
     var cw = x1 - x0, ch = y1 - y0;
 
@@ -308,31 +338,52 @@
     maxFps = Math.ceil(maxFps / 30) * 30;
     if (maxFps < 60) maxFps = 60;
 
-    // 网格
-    ctx.strokeStyle = '#1c2028';
-    ctx.fillStyle = '#4b5261';
-    ctx.font = '10px Consolas, monospace';
-    ctx.textAlign = 'right';
-    ctx.textBaseline = 'middle';
-    var steps = 4;
-    for (var i = 0; i <= steps; i++){
-      var v = maxFps * i / steps;
-      var y = y1 - ch * i / steps;
-      ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
-      ctx.fillText(Math.round(v), x0 - 5, y);
+    if (full){
+      cx.strokeStyle = '#1c2028';
+      cx.fillStyle = '#4b5261';
+      cx.font = '10px Consolas, monospace';
+      cx.textAlign = 'right';
+      cx.textBaseline = 'middle';
+      var steps = 4;
+      for (var i = 0; i <= steps; i++){
+        var v = maxFps * i / steps;
+        var y = y1 - ch * i / steps;
+        cx.beginPath(); cx.moveTo(x0, y); cx.lineTo(x1, y); cx.stroke();
+        cx.fillText(Math.round(v), x0 - 5, y);
+      }
+      if (maxFps > 60){
+        var y60 = y1 - ch * 60 / maxFps;
+        cx.strokeStyle = 'rgba(61,220,132,.25)';
+        cx.setLineDash([3, 3]);
+        cx.beginPath(); cx.moveTo(x0, y60); cx.lineTo(x1, y60); cx.stroke();
+        cx.setLineDash([]);
+      }
+    } else {
+      // 浮窗：只画 60 / 30 两条细线
+      cx.strokeStyle = 'rgba(255,255,255,.05)';
+      [0.25, 0.5, 0.75].forEach(function(p){
+        var y = y1 - ch * p;
+        cx.beginPath(); cx.moveTo(x0, y); cx.lineTo(x1, y); cx.stroke();
+      });
     }
 
-    if (maxFps > 60){
-      var y60 = y1 - ch * 60 / maxFps;
-      ctx.strokeStyle = 'rgba(61,220,132,.25)';
-      ctx.setLineDash([3, 3]);
-      ctx.beginPath(); ctx.moveTo(x0, y60); ctx.lineTo(x1, y60); ctx.stroke();
-      ctx.setLineDash([]);
+    // 填充
+    cx.beginPath();
+    cx.moveTo(x0, y1);
+    for (var i = 0; i < rollFps.length; i++){
+      var x = x0 + cw * i / (rollFps.length - 1);
+      var y = y1 - ch * Math.min(rollFps[i], maxFps) / maxFps;
+      cx.lineTo(x, y);
     }
+    cx.lineTo(x1, y1); cx.closePath();
+    var grad = cx.createLinearGradient(0, y0, 0, y1);
+    grad.addColorStop(0, 'rgba(61,220,132,.18)');
+    grad.addColorStop(1, 'rgba(61,220,132,0)');
+    cx.fillStyle = grad; cx.fill();
 
-    // 曲线分段染色
-    ctx.lineWidth = 2;
-    ctx.lineJoin = 'round';
+    // 曲线
+    cx.lineWidth = full ? 2 : 1.6;
+    cx.lineJoin = 'round';
     for (var i = 1; i < rollFps.length; i++){
       var v0 = rollFps[i-1], v1 = rollFps[i];
       var xa = x0 + cw * (i-1) / (rollFps.length-1);
@@ -340,29 +391,157 @@
       var ya = y1 - ch * Math.min(v0, maxFps) / maxFps;
       var yb = y1 - ch * Math.min(v1, maxFps) / maxFps;
       var avg = (v0 + v1) / 2;
-      ctx.strokeStyle = avg >= 55 ? '#3ddc84' : avg >= 30 ? '#ffb020' : '#ff5c5c';
-      ctx.beginPath(); ctx.moveTo(xa, ya); ctx.lineTo(xb, yb); ctx.stroke();
+      cx.strokeStyle = avg >= 55 ? '#3ddc84' : avg >= 30 ? '#ffb020' : '#ff5c5c';
+      cx.beginPath(); cx.moveTo(xa, ya); cx.lineTo(xb, yb); cx.stroke();
     }
-
-    // 填充
-    ctx.beginPath();
-    ctx.moveTo(x0, y1);
-    for (var i = 0; i < rollFps.length; i++){
-      var x = x0 + cw * i / (rollFps.length-1);
-      var y = y1 - ch * Math.min(rollFps[i], maxFps) / maxFps;
-      ctx.lineTo(x, y);
-    }
-    ctx.lineTo(x1, y1); ctx.closePath();
-    var grad = ctx.createLinearGradient(0, y0, 0, y1);
-    grad.addColorStop(0, 'rgba(61,220,132,.18)');
-    grad.addColorStop(1, 'rgba(61,220,132,0)');
-    ctx.fillStyle = grad; ctx.fill();
-
-    ctx.font = '10px Consolas, monospace';
-    ctx.fillStyle = '#4b5261';
-    ctx.textAlign = 'right';
-    ctx.fillText('MAX ' + maxFps, x1 - 4, y0 + 6);
   }
+
+  function drawChart(){
+    var dpr = window.devicePixelRatio || 1;
+    drawChartOn(chart, ctx, chart.width / dpr, chart.height / dpr, true);
+  }
+
+  // ==================== 浮窗（Document PiP） ====================
+  var pipWindow = null;
+  var pipCanvas = null;
+  var pipCtx = null;
+
+  function copyStyles(dstDoc){
+    // 复制所有样式表
+    for (var i = 0; i < document.styleSheets.length; i++){
+      var sheet = document.styleSheets[i];
+      try{
+        var rules = sheet.cssRules || sheet.rules;
+        if (!rules) continue;
+        var css = '';
+        for (var j = 0; j < rules.length; j++){
+          css += rules[j].cssText + '\n';
+        }
+        var style = dstDoc.createElement('style');
+        style.textContent = css;
+        dstDoc.head.appendChild(style);
+      }catch(e){
+        // 跨域样式表（比如外部 CSS），用 link 引用
+        if (sheet.href){
+          var link = dstDoc.createElement('link');
+          link.rel = 'stylesheet';
+          link.href = sheet.href;
+          dstDoc.head.appendChild(link);
+        }
+      }
+    }
+    // 覆盖 body margin
+    var extra = dstDoc.createElement('style');
+    extra.textContent = 'html,body{margin:0;padding:0;background:#0f1115;overflow:hidden;height:100%}';
+    dstDoc.head.appendChild(extra);
+  }
+
+  async function openPiP(){
+    if (!('documentPictureInPicture' in window)){
+      showToast('此浏览器不支持浮窗，请用 Chrome/Edge 116+', 'var(--red)');
+      return;
+    }
+    if (pipWindow){
+      try{ pipWindow.focus(); }catch(e){}
+      return;
+    }
+
+    try{
+      pipWindow = await documentPictureInPicture.requestWindow({
+        width: 360,
+        height: 240
+      });
+    }catch(e){
+      showToast('浮窗被拒绝：' + e.message, 'var(--red)');
+      return;
+    }
+
+    copyStyles(pipWindow.document);
+
+    pipWindow.document.body.innerHTML = ''
+      + '<div class="pip-root">'
+      + '  <div class="pip-head">'
+      + '    <span class="pip-fps" id="pip-fps">--</span>'
+      + '    <span class="pip-unit">FPS</span>'
+      + '    <span class="pip-ms" id="pip-ms">-- ms</span>'
+      + '  </div>'
+      + '  <canvas class="pip-chart" id="pip-chart"></canvas>'
+      + '  <div class="pip-stats">'
+      + '    <span>平均 <b id="pip-avg">--</b></span>'
+      + '    <span>1%Low <b id="pip-p1">--</b></span>'
+      + '    <span>最低 <b id="pip-min">--</b></span>'
+      + '    <span>卡顿 <b id="pip-stut">--</b></span>'
+      + '  </div>'
+      + '</div>';
+
+    pipCanvas = pipWindow.document.getElementById('pip-chart');
+    pipCtx = pipCanvas.getContext('2d');
+
+    // 窗口大小变化时重设 canvas
+    pipWindow.addEventListener('resize', resizePiPCanvas);
+    resizePiPCanvas();
+
+    // 关闭时清理
+    pipWindow.addEventListener('pagehide', function(){
+      pipWindow = null;
+      pipCanvas = null;
+      pipCtx = null;
+    });
+
+    // 立即刷新一次
+    updatePiP();
+    drawPiPChart();
+
+    var btn = document.getElementById('btn-pip');
+    btn.classList.add('active');
+    btn.textContent = '◱ 浮窗中';
+    showToast('浮窗已开启', 'var(--green)');
+  }
+
+  function resizePiPCanvas(){
+    if (!pipCanvas || !pipWindow) return;
+    var dpr = pipWindow.devicePixelRatio || 1;
+    var rect = pipCanvas.getBoundingClientRect();
+    pipCanvas.width  = Math.max(1, Math.floor(rect.width  * dpr));
+    pipCanvas.height = Math.max(1, Math.floor(rect.height * dpr));
+    pipCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function drawPiPChart(){
+    if (!pipCanvas || !pipCtx || !pipWindow) return;
+    var dpr = pipWindow.devicePixelRatio || 1;
+    var w = pipCanvas.width / dpr;
+    var h = pipCanvas.height / dpr;
+    drawChartOn(pipCanvas, pipCtx, w, h, false);
+  }
+
+  function updatePiP(){
+    if (!pipWindow || !pipWindow.document) return;
+    var doc = pipWindow.document;
+
+    var fpsEl = doc.getElementById('pip-fps');
+    if (fpsEl){
+      fpsEl.textContent = Math.round(curFps);
+      fpsEl.style.color = fpsColorVar(curFps);
+    }
+    var msEl = doc.getElementById('pip-ms');
+    if (msEl) msEl.textContent = curDt.toFixed(1) + ' ms';
+
+    function set(id, val, clsCheck){
+      var e = doc.getElementById(id);
+      if (!e) return;
+      e.textContent = val;
+      if (clsCheck && Number.isFinite(clsCheck)){
+        e.className = fpsColorClass(clsCheck);
+      }
+    }
+    set('pip-avg', fmt(stats.avg, 1), stats.avg);
+    set('pip-p1',  fmt(stats.p1, 1), stats.p1);
+    set('pip-min', fmt(stats.min, 1), stats.min);
+    set('pip-stut', stats.stutters == null ? '--' : String(stats.stutters), null);
+  }
+
+  document.getElementById('btn-pip').onclick = openPiP;
 
   // ==================== 帧循环 ====================
   function frameLoop(t){
@@ -399,21 +578,49 @@
       if (rollFps.length > HISTORY) rollFps.shift();
       lastChartPush = t;
       updateUI();
+      updatePiP();
       drawChart();
+      drawPiPChart();
     }
     requestAnimationFrame(frameLoop);
   }
 
   // ==================== UI ====================
-  function fpsColor(f){
-    if (f >= 55) return 'var(--green)';
-    if (f >= 30) return 'var(--yellow)';
-    return 'var(--red)';
+  function computeStats(){
+    if (samples.length === 0){
+      stats = { avg:null, min:null, max:null, p1:null, p01:null, stutters:null };
+      return;
+    }
+    var fpsArr = samples.map(function(s){ return s.fps; }).sort(function(a,b){ return a-b; });
+    var n = fpsArr.length;
+    var sum = 0;
+    for (var i = 0; i < n; i++) sum += fpsArr[i];
+    var avg = sum / n;
+    var min = fpsArr[0];
+    var max = fpsArr[n - 1];
+
+    var cnt1  = Math.max(1, Math.floor(n * 0.01));
+    var cnt01 = Math.max(1, Math.floor(n * 0.001));
+    var s1 = 0, s01 = 0;
+    for (var i = 0; i < cnt1;  i++) s1  += fpsArr[i];
+    for (var i = 0; i < cnt01; i++) s01 += fpsArr[i];
+
+    var avgDt = 1000 / avg;
+    var stutters = 0;
+    for (var i = 0; i < n; i++){
+      if (samples[i].dt > avgDt * 2) stutters++;
+    }
+
+    stats = {
+      avg: avg, min: min, max: max,
+      p1: s1 / cnt1, p01: s01 / cnt01,
+      stutters: stutters
+    };
   }
 
   function updateUI(){
     setText('bigfps', Math.round(curFps));
-    document.getElementById('bigfps').style.color = fpsColor(curFps);
+    document.getElementById('bigfps').style.color = fpsColorVar(curFps);
     setText('frametime', curDt.toFixed(2));
     setText('framecount', samples.length.toLocaleString());
     var dur = recording ? (now() - startTime) / 1000 : 0;
@@ -422,39 +629,14 @@
     var t = new Date();
     setText('clock', pad(t.getHours()) + ':' + pad(t.getMinutes()) + ':' + pad(t.getSeconds()));
 
-    if (samples.length > 0){
-      var fpsArr = samples.map(function(s){ return s.fps; }).sort(function(a,b){ return a-b; });
-      var n = fpsArr.length;
-      var sum = 0;
-      for (var i = 0; i < n; i++) sum += fpsArr[i];
-      var avg = sum / n;
-      var min = fpsArr[0];
-      var max = fpsArr[n-1];
+    computeStats();
 
-      var cnt1  = Math.max(1, Math.floor(n * 0.01));
-      var cnt01 = Math.max(1, Math.floor(n * 0.001));
-      var sum1 = 0, sum01 = 0;
-      for (var i = 0; i < cnt1;  i++) sum1  += fpsArr[i];
-      for (var i = 0; i < cnt01; i++) sum01 += fpsArr[i];
-      var p1 = sum1 / cnt1, p01 = sum01 / cnt01;
-
-      var avgDt = 1000 / avg;
-      var stutters = 0;
-      for (var i = 0; i < n; i++){
-        if (samples[i].dt > avgDt * 2) stutters++;
-      }
-
-      setText('s-avg', fmt(avg, 1));
-      setText('s-min', fmt(min, 1));
-      setText('s-max', fmt(max, 1));
-      setText('s-p1', fmt(p1, 1));
-      setText('s-p01', fmt(p01, 1));
-      setText('s-stut', stutters);
-    } else {
-      ['s-avg','s-min','s-max','s-p1','s-p01','s-stut'].forEach(function(id){
-        setText(id, '--');
-      });
-    }
+    setText('s-avg',  fmt(stats.avg, 1));
+    setText('s-min',  fmt(stats.min, 1));
+    setText('s-max',  fmt(stats.max, 1));
+    setText('s-p1',   fmt(stats.p1, 1));
+    setText('s-p01',  fmt(stats.p01, 1));
+    setText('s-stut', stats.stutters == null ? '--' : String(stats.stutters));
 
     if (recording){
       setText('info', '● 记录中 · 段#' + segment + ' · ' + samples.length + ' 帧');
@@ -482,10 +664,6 @@
       btnToggle.classList.remove('primary');
       btnToggle.classList.add('danger');
       btnExport.disabled = true;
-      // 顺手请求常亮（用户点击了，满足 user activation）
-      if (!wakeWanted){
-        // 不自动开启，只提示用户
-      }
       showToast('开始记录', 'var(--green)');
     } else {
       recording = false;
@@ -511,20 +689,20 @@
     btnToggle.classList.add('primary');
     btnExport.disabled = true;
     updateUI();
+    updatePiP();
     drawChart();
+    drawPiPChart();
     showToast('已清空', 'var(--red)');
   };
 
   btnExport.onclick = function(){
     if (samples.length === 0){ showToast('没有数据', 'var(--red)'); return; }
-
     var lines = ['segment,timestamp_ms,frametime_ms,fps'];
     for (var i = 0; i < samples.length; i++){
       var s = samples[i];
       lines.push(s.segment + ',' + s.t.toFixed(2) + ',' +
                  s.dt.toFixed(3) + ',' + s.fps.toFixed(2));
     }
-
     var csv = lines.join('\r\n');
     var blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' });
     var url = URL.createObjectURL(blob);
